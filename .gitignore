@@ -1,0 +1,15 @@
+Debug/
+Release/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+.metadata/
+.settings/
+*.launch
+out/
+Thumbs.db
+desktop.ini 
