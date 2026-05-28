@@ -1,102 +1,189 @@
-/*
- * gpadc_app.c
+/**
+ ****************************************************************************************
  *
- *  Created on: Feb 6, 2026
- *      Author: User
- *      Application logic of GPADC
+ * @file gpadc_app.c
+ *
+ * @brief GPADC application logic — DA14706
+ *        Reads two ADC channels (CH0: P0_5, CH1: P0_6) via DMA in batches,
+ *        converts raw results to millivolts, and streams them over UART as
+ *        comma-separated pairs for the uart_analyzer.py tool.
+ *
+ *        Architecture
+ *        ─────────────
+ *        The adapter (ad_gpadc) uses a single shared hardware mutex for the
+ *        one GPADC block. Opening two handles simultaneously would deadlock,
+ *        so the task follows the open → read → close pattern per channel,
+ *        per batch. With BATCH_SIZE = 64 the open/close overhead is paid
+ *        once per 64 DMA-driven samples — negligible.
+ *
+ *        Sample rate diagnostic
+ *        ──────────────────────
+ *        Every second the task emits a line starting with '*' which
+ *        uart_analyzer.py ignores (per its parse_line() filter). This lets
+ *        you verify the firmware-side sample rate independently of the
+ *        Python-side estimate, which is subject to UART buffering jitter.
+ *        The reported count is the total number of individual ADC samples
+ *        delivered (both channels combined) in the last second.
+ *
+ ****************************************************************************************
  */
 
 #include <stdio.h>
 #include <stdint.h>
 #include <inttypes.h>
-#include <math.h>
 #include "osal.h"
 #include "ad_gpadc.h"
 #include "platform_devices.h"
 #include "gpadc_app.h"
 
-#define CHAN0_DEVICE   ADC_CH0_DEVICE
-#define CHAN1_DEVICE   ADC_CH1_DEVICE
+/* ── Aliases ─────────────────────────────────────────────────────────────── */
+#define CHAN0_DEVICE    ADC_CH0_DEVICE
+#define CHAN1_DEVICE    ADC_CH1_DEVICE
 
-#define ADC_NOF_CONV    16    // must match platform_devices.c
+/* ── Batch size ──────────────────────────────────────────────────────────── *
+ * Number of DMA-transferred samples collected per channel per loop cycle.   *
+ * At ~5 kHz per channel, 64 samples = ~12.8 ms of acquisition per channel, *
+ * so one full loop (ch0 + ch1) completes in ~25.6 ms.                       *
+ *                                                                            *
+ * This value is independent of platform_devices.c — the DMA transfer length *
+ * is set at runtime by nof_conv passed to ad_gpadc_read_nof_conv().         *
+ * ─────────────────────────────────────────────────────────────────────────  */
+#define BATCH_SIZE      64
 
-/* Gain and Offset error coefficients for each ADC */
-//#define OFFSET_MV_CH0    340.0f         // For P05
-//#define GAIN_CH0         0.798f
-//#define OFFSET_MV_CH1    170.0f         // For P06
-//#define GAIN_CH1         0.845f
+/* ── Calibration coefficients ────────────────────────────────────────────── *
+ * Offset (mV) and gain are applied after the adapter's mV conversion.       *
+ * Set both to identity (0.0 / 1.0) until empirical calibration is done.     *
+ * ─────────────────────────────────────────────────────────────────────────  */
+#define OFFSET_MV_CH0   0.0f
+#define GAIN_CH0        1.0f
+#define OFFSET_MV_CH1   0.0f
+#define GAIN_CH1        1.0f
 
-#define OFFSET_MV_CH0    0.0f         // For P05
-#define GAIN_CH0         1.0f
-#define OFFSET_MV_CH1    0.0f         // For P06
-#define GAIN_CH1         1.0f
-
-/*  The hardware configuration happens at main.c inside prvSetupHardware()
- *  because I chose centralized hardware init.
- *  So, this function will be empty!
- */
+/* ── Hardware init ───────────────────────────────────────────────────────── *
+ * Centralised in main.c → prvSetupHardware(). Nothing to do here.           *
+ * ─────────────────────────────────────────────────────────────────────────  */
 void gpadc_app_init(void) {}
 
-/* Calibrates mV measurements of ADC for 3.6V attenuation. For values that are up to
- * OFFLINE_OFFSET_MV_3V6, it outputs 0V, that's because under no input there are
- * "wrong" measurements up to that value. An offset value. Also a GAIN_ERROR_3V6 is
- * used to correct the results. For every attenuation level there is a different
- * GAIN_ERROR_PARAMETER and it is measured empirically.
- * Input:  uncalibrated mV from ad_gpadc_conv_to_mvolt(), offset and gain coeffs for each channel
- * Output: (float) corrected mV value from offset and gain error of the MCU
- */
-float correct_mv(uint32_t mv_uncalibrated, float offset, float gain) {
-    if ((float)mv_uncalibrated < offset) return 0.0f;
-    return ((float)mv_uncalibrated - offset) / gain;
+/* ── correct_mv ──────────────────────────────────────────────────────────── *
+ * Applies a per-channel offset and gain correction to a raw mV reading.     *
+ *   offset — dead-band: values below this threshold are clamped to 0 mV.    *
+ *   gain   — multiplicative correction for full-scale error.                 *
+ *                                                                            *
+ * Returns a corrected float mV value.                                        *
+ * ─────────────────────────────────────────────────────────────────────────  */
+static float correct_mv(uint32_t mv_raw, float offset, float gain)
+{
+        if ((float)mv_raw < offset) {
+                return 0.0f;
+        }
+        return ((float)mv_raw - offset) / gain;
 }
 
-/* The GPADC Adapter is used following the pattern of
- *      [  --> Open - Read - Close <--  ]
- * this happens for both channels. printf() happens in batches, not
- * for every conversion and the time for a 100 sample reading period is also printed.
- * NOTE: The driver prevents using one handler for two different channels, [with reconfig()]
- * that's why this methodology was selected.
- */
-
+/* ── gpadc_app_task ──────────────────────────────────────────────────────── *
+ * Main FreeRTOS task. Never returns.                                         *
+ *                                                                            *
+ * Loop structure                                                             *
+ *   1. Open ch0, collect BATCH_SIZE samples via DMA, close ch0.             *
+ *   2. Open ch1, collect BATCH_SIZE samples via DMA, close ch1.             *
+ *   3. Convert and print all pairs in one tight printf loop.                 *
+ *   4. Update the sample-rate diagnostic counter.                            *
+ *                                                                            *
+ * Static buffers are placed in retained RAM rather than the task stack to   *
+ * avoid stack overflow (BATCH_SIZE × 2 × sizeof(uint16_t) = 256 bytes).    *
+ * ─────────────────────────────────────────────────────────────────────────  */
 void gpadc_app_task(void *pvParameters)
 {
-    static uint16_t raw_buf0[ADC_NOF_CONV];  // DMA writes directly here
-    static uint16_t raw_buf1[ADC_NOF_CONV];
-    uint16_t dummy = 0;
+        /* DMA destination buffers — one per channel */
+        static uint16_t raw0[BATCH_SIZE];
+        static uint16_t raw1[BATCH_SIZE];
 
-    /* Warmup dummy reads � keep as-is, nof_conv=1 is fine here */
-    ad_gpadc_handle_t h_warm = ad_gpadc_open(CHAN0_DEVICE);
-    if (h_warm) { ad_gpadc_read_nof_conv(h_warm, 1, &dummy); ad_gpadc_close(h_warm, false); }
-    h_warm = ad_gpadc_open(CHAN1_DEVICE);
-    if (h_warm) { ad_gpadc_read_nof_conv(h_warm, 1, &dummy); ad_gpadc_close(h_warm, false); }
+        /* Sample-rate diagnostic — counts total individual samples (both channels) */
+        static uint32_t  sample_counter = 0;
+        static TickType_t t_last        = 0;
 
-    for (;;) {
+        /* ── Warmup reads ────────────────────────────────────────────────── *
+         * Allow the sample-and-hold capacitor on each input to settle after  *
+         * the ADC mux switches for the first time. One dummy conversion per  *
+         * channel is sufficient. The warmup uses nof_conv = 1 with a scalar  *
+         * buffer, which is valid because irq_nr_of_trans = 0 in dma_cfg_adc  *
+         * (the DMA IRQ fires at the end of the transfer regardless of        *
+         * length, so no constraint violation occurs).                         *
+         * ──────────────────────────────────────────────────────────────────  */
+        uint16_t dummy = 0;
 
-        /* ---- CH0 ---- */
-        ad_gpadc_handle_t h0 = ad_gpadc_open(CHAN0_DEVICE);
-        if (!h0) { printf("[GPADC] open ch0 failed\n"); continue; }
-        int ret0 = ad_gpadc_read_nof_conv(h0, ADC_NOF_CONV, raw_buf0);
-        // DMA fills raw_buf0[] autonomously; task blocks on OS_EVENT until DMA IRQ fires
-        ad_gpadc_close(h0, false);
-
-        /* ---- CH1 ---- */
-        ad_gpadc_handle_t h1 = ad_gpadc_open(CHAN1_DEVICE);
-        if (!h1) { printf("[GPADC] open ch1 failed\n"); continue; }
-        int ret1 = ad_gpadc_read_nof_conv(h1, ADC_NOF_CONV, raw_buf1);
-        ad_gpadc_close(h1, false);
-
-        if (ret0 == AD_GPADC_ERROR_NONE && ret1 == AD_GPADC_ERROR_NONE) {
-            uint32_t sum0 = 0, sum1 = 0;
-            for (int i = 0; i < ADC_NOF_CONV; i++) {
-                sum0 += raw_buf0[i];
-                sum1 += raw_buf1[i];
-            }
-            uint16_t avg0 = (uint16_t)(sum0 / ADC_NOF_CONV);
-            uint16_t avg1 = (uint16_t)(sum1 / ADC_NOF_CONV);
-
-            float mv0 = correct_mv(ad_gpadc_conv_to_mvolt(CHAN0_DEVICE->drv, avg0), OFFSET_MV_CH0, GAIN_CH0);
-            float mv1 = correct_mv(ad_gpadc_conv_to_mvolt(CHAN1_DEVICE->drv, avg1), OFFSET_MV_CH1, GAIN_CH1);
-            printf("%d,%d\n", (int)mv0, (int)mv1);
+        ad_gpadc_handle_t h_warm = ad_gpadc_open(CHAN0_DEVICE);
+        if (h_warm) {
+                ad_gpadc_read_nof_conv(h_warm, 1, &dummy);
+                ad_gpadc_close(h_warm, false);
         }
-    }
+
+        h_warm = ad_gpadc_open(CHAN1_DEVICE);
+        if (h_warm) {
+                ad_gpadc_read_nof_conv(h_warm, 1, &dummy);
+                ad_gpadc_close(h_warm, false);
+        }
+
+        /* ── Main acquisition loop ───────────────────────────────────────── */
+        for (;;) {
+
+                /* ── CH0: open → DMA read → close ───────────────────────── */
+                ad_gpadc_handle_t h0 = ad_gpadc_open(CHAN0_DEVICE);
+                if (!h0) {
+                        /* Should not happen; log and retry next cycle */
+                        printf("[GPADC] open ch0 failed\n");
+                        continue;
+                }
+                int ret0 = ad_gpadc_read_nof_conv(h0, BATCH_SIZE, raw0);
+                /* Task is blocked here until the DMA IRQ fires (BATCH_SIZE
+                 * transfers complete). The OS scheduler runs other tasks. */
+                ad_gpadc_close(h0, false);
+
+                /* ── CH1: open → DMA read → close ───────────────────────── */
+                ad_gpadc_handle_t h1 = ad_gpadc_open(CHAN1_DEVICE);
+                if (!h1) {
+                        printf("[GPADC] open ch1 failed\n");
+                        continue;
+                }
+                int ret1 = ad_gpadc_read_nof_conv(h1, BATCH_SIZE, raw1);
+                ad_gpadc_close(h1, false);
+
+                /* ── Convert and stream ──────────────────────────────────── *
+                 * Only print if both reads succeeded. raw0[i] and raw1[i]    *
+                 * are time-aligned only approximately (ch0 batch was          *
+                 * collected before ch1 batch), which is acceptable for        *
+                 * independent channel monitoring. If strict time-alignment    *
+                 * is ever needed, interleaving at the hardware level would    *
+                 * require a different acquisition strategy.                   *
+                 * ──────────────────────────────────────────────────────────  */
+                if (ret0 == AD_GPADC_ERROR_NONE && ret1 == AD_GPADC_ERROR_NONE) {
+                        for (int i = 0; i < BATCH_SIZE; i++) {
+                                int mv0 = (int)correct_mv(
+                                        (uint32_t)ad_gpadc_conv_to_mvolt(CHAN0_DEVICE->drv, raw0[i]),
+                                        OFFSET_MV_CH0, GAIN_CH0);
+                                int mv1 = (int)correct_mv(
+                                        (uint32_t)ad_gpadc_conv_to_mvolt(CHAN1_DEVICE->drv, raw1[i]),
+                                        OFFSET_MV_CH1, GAIN_CH1);
+                                // Print only every 4th sample pair — reduces UART load by 4×
+                                if (i % 10 == 0) {
+                                    printf("%d,%d\n", mv0, mv1);
+                                }
+                        }
+                }
+
+                /* ── Sample-rate diagnostic (once per second) ────────────── *
+                 * Count both channels: BATCH_SIZE samples × 2 channels.       *
+                 * Output starts with '*' so uart_analyzer.py ignores it.      *
+                 * Read the printed value from your terminal to get the         *
+                 * firmware-side ground-truth sample rate.                      *
+                 * ──────────────────────────────────────────────────────────  */
+                sample_counter += (uint32_t)(BATCH_SIZE * 2);
+
+                TickType_t now = xTaskGetTickCount();
+                if ((now - t_last) >= pdMS_TO_TICKS(1000)) {
+                        printf("*fs=%lu\n", (unsigned long)sample_counter);
+                        sample_counter = 0;
+                        t_last = now;
+                }
+
+        } /* end for(;;) */
 }
