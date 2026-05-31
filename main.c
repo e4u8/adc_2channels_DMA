@@ -117,7 +117,7 @@ static void system_init(void *pvParameters)
                                              debug only; not used by the kernel. */
                         gpadc_app_task,    /* The function that implements the task. */
                         NULL,               /* The parameter passed to the task. */
-                        3072 * OS_STACK_WORD_SIZE,  /* Stack size allocated for the task
+                        1024 * OS_STACK_WORD_SIZE,  /* Stack size allocated for the task
                                                     in bytes. */
                         mainGPADC_TASK_PRIORITY, /* The priority assigned to the task. */
                         prvGPADCTask_h );       /* The task handle. */
