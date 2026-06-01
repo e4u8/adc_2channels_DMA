@@ -23,7 +23,8 @@
 
 #if dg_configGPADC_ADAPTER || dg_configUSE_HW_GPADC
 
-#define ADC_NOF_CONV    16    // batch size; must be consistent with gpadc_app.c
+/* ADC_NOF_CONV removed: irq_nr_of_trans is now 0 (terminal-count only),
+ * decoupled from gpadc_app.c batch size. */
 
 /* ---------------------------------------------------------------
  * DMA config � ONE struct shared by both channels.
@@ -40,9 +41,9 @@
 static gpadc_dma_cfg dma_cfg_adc = {
     .channel         = HW_DMA_CHANNEL_0,  // must be even; change if ch0/1 used elsewhere
     .prio            = HW_DMA_PRIO_2,
-    .circular        = false,             // one-shot: DMA stops after ADC_NOF_CONV transfers
-    .irq_nr_of_trans = ADC_NOF_CONV,      // fire callback exactly once, after all N transfers
-                                          // MUST equal the nof_conv you pass to read_nof_conv()
+    .circular        = false,             // one-shot: DMA stops after nof_conv transfers
+    .irq_nr_of_trans = 0,                 // no midpoint IRQ; relies on DMA terminal count only
+                                          // 0 satisfies irq_nr_of_trans<=nof_conv for any nof_conv
 };
 #endif
 

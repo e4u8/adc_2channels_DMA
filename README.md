@@ -1,6 +1,6 @@
 # adc_2channels_DMA
 
-Dual-channel ADC acquisition firmware for the **Dialog Semiconductor DA14706** (DA1470x family), using DMA-driven transfers and FreeRTOS. Both analog input channels are sampled continuously at ~5 kHz, with digitized millivolt values streamed over UART to a host analyzer.
+Dual-channel ADC acquisition firmware for the **Dialog Semiconductor DA14706** (DA1470x family), using DMA-driven transfers and FreeRTOS. The two channels are sampled in an interleaved fashion — voltage (CH0) and current (CH1) back-to-back — at ~2.5 kHz per channel, with time-aligned pairs streamed over UART for power-factor analysis.
 
 ---
 
@@ -29,11 +29,14 @@ Dual-channel ADC acquisition firmware for the **Dialog Semiconductor DA14706** (
 This project demonstrates efficient dual-channel analog acquisition on the DA14706 BLE SoC. The General Purpose ADC (GPADC) is driven via DMA, meaning the CPU is free to run other tasks while the hardware moves conversion results directly into memory. FreeRTOS coordinates the acquisition task with system initialization.
 
 **Key capabilities:**
-- Two independent single-ended analog input channels (P0.5 and P0.6)
-- DMA-accelerated batch acquisition (64 samples per channel per DMA burst)
+- Two time-aligned channels: CH0 = voltage (P0.5), CH1 = current (P0.6)
+- Interleaved single-sample acquisition — V and I sampled back-to-back per pair
+- Fixed ~200 µs skew between paired samples (constant, correctable in PF calc)
+- Effective rate: ~2.5 kHz per channel (50 samples/cycle at 50 Hz)
 - 4× oversampling and chopping enabled for improved accuracy
 - Input range up to 3.6 V with built-in attenuator
 - Per-channel calibration (offset + gain correction)
+- Raw pair streaming every `PRINT_EVERY` pairs for waveform verification
 - Firmware-side sample rate diagnostics (`*fs=<count>` every second)
 - Three execution targets: RAM, QSPI flash, OQSPI flash
 
@@ -104,20 +107,19 @@ Each iteration of `gpadc_app_task` performs the following sequence:
   Open CH1 → read 1 sample → Close CH1
 
 [Main loop — repeats forever]
-  1. Open CH0 handle (acquires GPADC mutex)
-  2. DMA-read BATCH_SIZE (64) samples into raw0[]  ← task blocks here
-  3. Close CH0 handle (releases mutex)
+  For i = 0 .. BATCH_SIZE-1:
+    1. Open CH0 → single DMA read → raw0[i] → Close CH0
+    2. Open CH1 → single DMA read → raw1[i] → Close CH1   ← ~200 µs after step 1
 
-  4. Open CH1 handle
-  5. DMA-read BATCH_SIZE (64) samples into raw1[]  ← task blocks here
-  6. Close CH1 handle
-
-  7. Convert raw0[i] and raw1[i] to millivolts with calibration
-  8. Print every 10th sample pair over UART
-  9. Every 1 second: print "*fs=<total_samples>" diagnostic
+  Convert raw0[i] and raw1[i] to millivolts with calibration.
+  Print every PRINT_EVERY-th pair over UART.
+  Every 1 second: print "*fs=<total_samples>" diagnostic.
 ```
 
-The channels are sampled **sequentially** (CH0 batch then CH1 batch), not interleaved at the individual sample level. Each channel shares the single GPADC hardware block protected by the adapter's internal mutex.
+CH0 (voltage) and CH1 (current) are sampled **back-to-back for every index i**,
+giving a fixed time skew of ~200 µs between `raw0[i]` and `raw1[i]`.
+This skew is constant across all pairs and will be corrected by a single
+phase-offset term in the PF calculation (Step 2).
 
 ### DMA Pipeline
 
@@ -126,15 +128,18 @@ GPADC hardware register
         │  (fires after each conversion)
         ▼
    DMA Channel 0
-        │  (burst of BATCH_SIZE transfers)
+        │  (1 transfer, terminal-count IRQ)
         ▼
-   raw0[] / raw1[]   (uint16_t arrays in retained RAM)
-        │  (DMA IRQ fires → unblocks task)
+   raw0[i] or raw1[i]   (uint16_t in retained RAM)
+        │  (DMA complete → unblocks task)
         ▼
-   gpadc_app_task    (resumes, converts to mV, prints)
+   gpadc_app_task        (advances i, opens next channel)
 ```
 
-The DMA is configured in **one-shot mode**: it fires an interrupt after exactly `ADC_NOF_CONV` transfers and then stops. The adapter reopens and retriggers the DMA for each batch. Because the task blocks on the DMA completion callback, the CPU is yielded to the RTOS scheduler while the hardware runs — zero busy-waiting.
+The DMA is configured in **one-shot mode** with `irq_nr_of_trans = 0` (terminal-count
+only), making it valid for `nof_conv = 1`. Because the task blocks on the DMA
+completion callback, the CPU is yielded to the RTOS scheduler during each
+conversion — zero busy-waiting.
 
 ---
 
@@ -204,7 +209,7 @@ Where `<mv0>` and `<mv1>` are floating-point millivolt values for CH0 and CH1 re
 
 The `*fs=<N>` line is emitted once per second and reports the cumulative number of samples acquired by the firmware. This is the ground-truth sample rate counter, useful for verifying that the host Python analyzer is receiving and counting samples at the same rate.
 
-The 10× decimation before printing reduces UART load by 10× without losing ADC data (all samples are still acquired into the DMA buffers; only the print rate is reduced).
+The `PRINT_EVERY` decimation reduces UART load without losing ADC data — all pairs are acquired into the buffers; only the print rate is reduced.
 
 ---
 
@@ -273,11 +278,14 @@ All commonly-tuned values are collected here for quick reference:
 
 | Symbol | File | Default | Purpose |
 |--------|------|---------|---------|
-| `BATCH_SIZE` | gpadc_app.c | `64` | DMA samples per channel per burst |
-| `MEAS_INTERVAL_MS` | main.c | `100` | Minimum ms between console prints (unused in current loop) |
-| `ADC_NOF_CONV` | platform_devices.c | `16` | DMA IRQ fires after this many transfers |
+| `BATCH_SIZE` | gpadc_app.c | `64` | (V, I) pairs collected per loop cycle |
+| `PRINT_EVERY` | gpadc_app.c | `8` | Print one raw pair every N pairs to UART |
 | `OFFSET_MV_CH0/1` | gpadc_app.c | `0.0f` | Per-channel mV offset calibration |
 | `GAIN_CH0/1` | gpadc_app.c | `1.0f` | Per-channel gain calibration |
+| `ZC_HYST_MV` | gpadc_app.c | `50` | Hysteresis band (mV) for zero-crossing detector |
+| `ZC_CYCLES_AVG` | gpadc_app.c | `5` | Complete cycles averaged per frequency update |
+| `CPU_CLOCK_HZ` | gpadc_app.c | `32000000` | Must match sysclk_XTAL32M in main.c |
+| `irq_nr_of_trans` | platform_devices.c | `0` | DMA midpoint IRQ disabled; terminal-count only |
 | `HW_GPADC_OVERSAMPLING_4_SAMPLES` | platform_devices.c | 4× | Oversampling ratio |
 | `HW_GPADC_INPUT_VOLTAGE_UP_TO_3V6` | platform_devices.c | 3.6 V | Input attenuator range |
 | `configTOTAL_HEAP_SIZE` | custom_config_*.h | `14000` | FreeRTOS heap in bytes |
