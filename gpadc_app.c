@@ -11,8 +11,10 @@
  *        ─────────────
  *        • DWT cycle counter — sub-microsecond timestamps, no OS overhead.
  *        • Startup skew print (*skew=) — exact CH0→CH1 inter-sample delay.
- *        • ZC detector on CH1 — hysteresis state machine on the batch DC mean.
- *        • Frequency update every ZC_CYCLES_AVG complete cycles (*freq= line).
+ *        • ZC detector on CH1 — Schmitt-trigger on rolling 1000-sample mean.
+ *          Frequency from DWT timestamps at last 20 rising crossings:
+ *            freq = (N-1) * CPU_HZ / (ts[N-1] - ts[0])
+ *          No sample-rate estimation needed — time measured directly in cycles.
  *
  ****************************************************************************************
  */
@@ -26,7 +28,6 @@
 #include "platform_devices.h"
 #include "gpadc_app.h"
 
-/* If CoreDebug / DWT are not visible, add:  #include "hw_cpm.h"  */
 
 /* ── Channel aliases ─────────────────────────────────────────────────────── */
 #define CHAN0_DEVICE    ADC_CH0_DEVICE   /* current channel */
@@ -42,24 +43,48 @@
 #define OFFSET_MV_CH1   0.0f
 #define GAIN_CH1        1.0f
 
-/* ── Zero-crossing tuning ────────────────────────────────────────────────── *
- * ZC_HYST_MV   — dead-band around the threshold.                             *
- *   Signal must exceed (threshold + HYST) for an upward crossing, and drop   *
- *   below (threshold - HYST) before the next crossing can be detected.        *
- *   Increase if *freq= is unstable; decrease if crossings are missed.         *
- *                                                                             *
- * ZC_CYCLES_AVG — number of complete cycles per frequency update.             *
- *   Frequency error ≈ ±1 sample / (ZC_CYCLES_AVG × samples_per_cycle).       *
- *   At 50 Hz / ~1800 sps: 5 cycles → ±0.28 Hz error, 100 ms update rate.    *
- * ─────────────────────────────────────────────────────────────────────────  */
-#define ZC_HYST_MV      50
-#define ZC_CYCLES_AVG    5
-
 /* ── CPU clock ───────────────────────────────────────────────────────────── *
  * DWT->CYCCNT increments every CPU clock cycle.                               *
  * Must match sysclk_XTAL32M configured in main.c.                            *
  * ─────────────────────────────────────────────────────────────────────────  */
 #define CPU_CLOCK_HZ    32000000UL
+
+/* ── Zero-crossing frequency detection ──────────────────────────────────── *
+ *                                                                             *
+ *  STATS_WIN   : rolling mean window for DC threshold (samples)              *
+ *  CROSS_MAXLEN: DWT timestamp history depth                                 *
+ *  HYST_MV     : hysteresis dead-band — must be < AC amplitude               *
+ *  FREQ_NOM    : nominal signal freq, used only for the crossing guard       *
+ *                                                                             *
+ *  Algorithm:                                                                 *
+ *   1. threshold  = rolling mean of last STATS_WIN CH1 samples (≈ DC level) *
+ *   2. Schmitt-trigger: arm on fall below (mean − HYST), fire on rise above  *
+ *   3. At each rising crossing: record DWT->CYCCNT in circular buffer        *
+ *   4. freq = (N−1) × CPU_HZ / (ts[N−1] − ts[0])                           *
+ *      No sample-rate estimate — time measured directly in cycles.           *
+ * ─────────────────────────────────────────────────────────────────────────  */
+#define ZC_STATS_WIN     1000
+#define ZC_CROSS_MAXLEN    20
+#define ZC_HYST_MV         10
+#define SIGNAL_FREQ_NOM  50.0f
+
+/* Rolling mean buffer */
+static int32_t  zc_stats[ZC_STATS_WIN];
+static uint32_t zc_stats_idx   = 0;
+static int32_t  zc_stats_sum   = 0;
+static uint32_t zc_stats_count = 0;   /* saturates at ZC_STATS_WIN */
+
+/* Crossing timestamp history — DWT cycles at each rising crossing */
+static uint32_t zc_cross_cy[ZC_CROSS_MAXLEN];
+static int      zc_cross_cnt = 0;
+
+/* Schmitt-trigger state */
+static bool     zc_armed        = true;   /* TRUE = below threshold, ready to detect */
+static uint32_t zc_last_cross   = 0;      /* zc_sample_count value at last crossing  */
+static uint32_t zc_sample_count = 0;      /* total CH1 samples processed             */
+
+/* Published result */
+static float    freq_hz = 0.0f;
 
 /* ─────────────────────────────────────────────────────────────────────────── */
 
@@ -71,80 +96,82 @@ static float correct_mv(uint32_t mv_raw, float offset, float gain)
         return ((float)mv_raw - offset) / gain;
 }
 
-/* ── Zero-crossing state ─────────────────────────────────────────────────── *
- * File-scope so zc_update() can access it without passing pointers.           *
- * All fields are zero-initialised by the C runtime (static storage).          *
- *                                                                             *
- * State diagram:                                                              *
- *                                                                             *
- *   BELOW ──(mv > threshold + HYST)──► ABOVE   ← upward crossing event      *
- *   ABOVE ──(mv < threshold − HYST)──► BELOW                                 *
- *                                                                             *
- * On every upward crossing:                                                   *
- *   • First ever   → anchor the measurement window (save t_window_start).    *
- *   • Subsequent   → increment zc_cycle_cnt.                                  *
- *                    When zc_cycle_cnt == ZC_CYCLES_AVG:                      *
- *                      freq = ZC_CYCLES_AVG × CPU_CLOCK_HZ / elapsed_cycles   *
- *                      reset window to this crossing.                          *
- * ─────────────────────────────────────────────────────────────────────────  */
-static bool     zc_above        = false;
-static bool     zc_first_seen   = false;
-static uint32_t zc_sample_start = 0;   /* global CH1 sample index at window-open ZC  */
-static uint32_t zc_global_idx   = 0;   /* total CH1 samples acquired across all batches */
-static int      zc_cycle_cnt    = 0;
-static float    freq_hz         = 0.0f;   /* 0 until first measurement */
-
-/*
- * zc_update — call once per voltage sample.
- *
- * mv              mV value of the voltage sample
- * threshold_mv    DC offset estimate (batch mean) used as crossing baseline
- * sample_time_cy  estimated DWT timestamp when this sample was acquired
- */
 /*
  * zc_update — call once per CH1 sample.
  *
- * mv             mV value of the voltage sample
- * threshold_mv   batch mean used as crossing baseline
- * dt_sample_cy   within-batch inter-sample time in DWT cycles
- *                (= (t_acq_end - t_acq_start) / BATCH_SIZE for the current batch)
+ * Directly mirrors the per-sample block in Python's update() function:
  *
- * Why sample counting instead of DWT timestamps:
- *   t_acq_start includes the previous batch's UART+processing time (~29 ms).
- *   If the ZC window straddles batch boundaries that gap inflates elapsed_cy and
- *   makes the measured frequency too low (e.g. 31 Hz instead of 50 Hz).
- *   Counting acquired samples excludes inter-batch idle time entirely.
- *
- *   freq = ZC_CYCLES_AVG × f_acq / elapsed_samples
- *   where f_acq = CPU_CLOCK_HZ / dt_sample_cy  (within-batch acquisition rate)
+ *   ch1_stats.append(mv1)
+ *   ch1_mean = sum(ch1_stats) / len(ch1_stats)
+ *   if cross_armed:
+ *       if mv1 >= ch1_mean and sample_count - last_cross > min_cross_gap:
+ *           cross_timestamps.append(sample_count)
+ *           cross_armed = False
+ *           freq = measured_rate_hz / avg_gap
+ *   else:
+ *       if mv1 < ch1_mean - HYST_MV:
+ *           cross_armed = True
  */
-static void zc_update(int mv, int threshold_mv, uint32_t dt_sample_cy)
+static void zc_update(int mv1)
 {
-        if (!zc_above && mv > threshold_mv + ZC_HYST_MV) {
+        /* ── 1. Rolling mean — mirrors ch1_stats deque(maxlen=1000) ── */
+        zc_stats_sum -= zc_stats[zc_stats_idx];
+        zc_stats[zc_stats_idx] = (int32_t)mv1;
+        zc_stats_sum += (int32_t)mv1;
+        zc_stats_idx = (zc_stats_idx + 1) % ZC_STATS_WIN;
+        if (zc_stats_count < ZC_STATS_WIN) zc_stats_count++;
 
-                zc_above = true;
+        /* Wait until the buffer is full — mirrors Python's implicit warm-up
+         * (deque starts empty; len(ch1_stats) < STATS_WIN returns a biased mean) */
+        if (zc_stats_count < ZC_STATS_WIN) {
+                zc_sample_count++;
+                return;
+        }
 
-                if (!zc_first_seen) {
-                        zc_sample_start = zc_global_idx;
-                        zc_first_seen   = true;
-                } else {
-                        zc_cycle_cnt++;
+        int ch1_mean = (int)(zc_stats_sum / (int32_t)ZC_STATS_WIN);
 
-                        if (zc_cycle_cnt >= ZC_CYCLES_AVG) {
-                                uint32_t elapsed_samples = zc_global_idx - zc_sample_start;
-                                if (elapsed_samples > 0 && dt_sample_cy > 0) {
-                                        freq_hz = (float)ZC_CYCLES_AVG
-                                                  * ((float)CPU_CLOCK_HZ / (float)dt_sample_cy)
-                                                  / (float)elapsed_samples;
-                                }
-                                zc_sample_start = zc_global_idx;
-                                zc_cycle_cnt    = 0;
+        /* ── 2. Guard: ignore crossings closer than half a nominal period ── *
+         * CPU_CLOCK_HZ / (SIGNAL_FREQ_NOM * 2) = cycles in one half-period.  *
+         * Compared against DWT cycles so no sample-rate estimate is needed.   */
+        static uint32_t zc_last_cross_cy = 0;
+        uint32_t now_cy        = DWT->CYCCNT;
+        uint32_t min_gap_cy    = (uint32_t)((float)CPU_CLOCK_HZ / (SIGNAL_FREQ_NOM * 2.0f));
+
+        /* ── 3. Schmitt-trigger state machine ── */
+        if (zc_armed) {
+                if ((mv1 >= ch1_mean) &&
+                    (now_cy - zc_last_cross_cy > min_gap_cy)) {
+
+                        /* Store DWT timestamp of this crossing */
+                        if (zc_cross_cnt < ZC_CROSS_MAXLEN) {
+                                zc_cross_cy[zc_cross_cnt++] = now_cy;
+                        } else {
+                                for (int k = 0; k < ZC_CROSS_MAXLEN - 1; k++)
+                                        zc_cross_cy[k] = zc_cross_cy[k + 1];
+                                zc_cross_cy[ZC_CROSS_MAXLEN - 1] = now_cy;
+                        }
+
+                        zc_last_cross    = zc_sample_count;
+                        zc_last_cross_cy = now_cy;
+                        zc_armed         = false;
+
+                        /* freq = (N-1 half-periods) * CPU_HZ / total_cycles
+                         * Each rising crossing is one full period apart, so N-1
+                         * gaps span N-1 full periods.                           */
+                        if (zc_cross_cnt >= 2) {
+                                uint32_t total_cy = zc_cross_cy[zc_cross_cnt - 1] - zc_cross_cy[0];
+                                if (total_cy > 0)
+                                        freq_hz = (float)(zc_cross_cnt - 1)
+                                                  * (float)CPU_CLOCK_HZ
+                                                  / (float)total_cy;
                         }
                 }
-
-        } else if (zc_above && mv < threshold_mv - ZC_HYST_MV) {
-                zc_above = false;
+        } else {
+                if (mv1 < ch1_mean - ZC_HYST_MV)
+                        zc_armed = true;
         }
+
+        zc_sample_count++;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -184,13 +211,13 @@ void gpadc_app_task(void *pvParameters)
                 ad_gpadc_handle_t h = ad_gpadc_open(CHAN0_DEVICE);
                 if (h) {
                         ad_gpadc_read_nof_conv(h, 1, &dummy);
-                        t_ch0_done = DWT->CYCCNT;   /* CH0 sample just arrived */
+                        t_ch0_done = DWT->CYCCNT;
                         ad_gpadc_close(h, false);
 
                         h = ad_gpadc_open(CHAN1_DEVICE);
                         if (h) {
                                 ad_gpadc_read_nof_conv(h, 1, &dummy);
-                                t_ch1_done = DWT->CYCCNT; /* CH1 sample just arrived */
+                                t_ch1_done = DWT->CYCCNT;
                                 ad_gpadc_close(h, false);
                                 both_ok = true;
                         }
@@ -207,12 +234,7 @@ void gpadc_app_task(void *pvParameters)
         /* ── Main loop ───────────────────────────────────────────────────── */
         for (;;) {
 
-                /* ── 1. Interleaved acquisition ──────────────────────────── *
-                 * Timestamp the batch start and end so we can estimate each    *
-                 * sample's acquisition time in step 3.                         *
-                 * ──────────────────────────────────────────────────────────  */
-                uint32_t t_acq_start = DWT->CYCCNT;
-
+                /* ── 1. Interleaved acquisition ──────────────────────────── */
                 for (int i = 0; i < BATCH_SIZE; i++) {
                         ad_gpadc_handle_t h0 = ad_gpadc_open(CHAN0_DEVICE);
                         if (h0) {
@@ -230,40 +252,7 @@ void gpadc_app_task(void *pvParameters)
                         }
                 }
 
-                uint32_t t_acq_end = DWT->CYCCNT;
-
-                /* ── 2. Compute ZC threshold from batch mean ─────────────── *
-                 * The voltage signal is DC-biased; "zero crossing" means       *
-                 * crossing its own mean, not 0 V.                              *
-                 *                                                              *
-                 * Since ad_gpadc_conv_to_mvolt is linear:                     *
-                 *   convert(mean(raw)) == mean(convert(raw))                   *
-                 * so summing raw integers (fast) then converting once is       *
-                 * mathematically identical to converting every sample first.   *
-                 * ──────────────────────────────────────────────────────────  */
-                uint32_t sum_raw1 = 0;
-                for (int i = 0; i < BATCH_SIZE; i++) {
-                        sum_raw1 += (uint32_t)raw1[i];
-                }
-                uint16_t mean_raw1    = (uint16_t)(sum_raw1 / (uint32_t)BATCH_SIZE);
-                int      threshold_mv = (int)correct_mv(
-                        (uint32_t)ad_gpadc_conv_to_mvolt(CHAN1_DEVICE->drv,
-                                                          mean_raw1),
-                        OFFSET_MV_CH1, GAIN_CH1);
-
-                /* ── 3. Per-sample: ZC detection + print ─────────────────── *
-                 * Estimated acquisition time for sample i:                    *
-                 *                                                              *
-                 *   t_sample[i] = t_acq_start + i × dt_sample_cy             *
-                 *                                                              *
-                 * where dt_sample_cy = (t_acq_end - t_acq_start) / BATCH_SIZE *
-                 *                                                              *
-                 * Assumes uniform spacing between samples — valid because the  *
-                 * open/close overhead is nearly constant for every iteration.  *
-                 * ──────────────────────────────────────────────────────────  */
-                uint32_t dt_sample_cy = (t_acq_end - t_acq_start)
-                                        / (uint32_t)BATCH_SIZE;
-
+                /* ── 2. Per-sample: convert, ZC detect, print ────────────── */
                 for (int i = 0; i < BATCH_SIZE; i++) {
                         int mv0_val = (int)correct_mv(
                                 (uint32_t)ad_gpadc_conv_to_mvolt(
@@ -274,15 +263,14 @@ void gpadc_app_task(void *pvParameters)
                                         CHAN1_DEVICE->drv, raw1[i]),
                                 OFFSET_MV_CH1, GAIN_CH1);
 
-                        zc_global_idx++;
-                        zc_update(mv1_val, threshold_mv, dt_sample_cy);
+                        zc_update(mv1_val);   /* single argument — all state is internal */
 
                         if (i % PRINT_EVERY == 0) {
                                 printf("%d,%d\n", mv0_val, mv1_val);
                         }
                 }
 
-                /* ── 4. Diagnostics (once per second) ────────────────────── */
+                /* ── 3. Diagnostics (once per second) ────────────────────── */
                 sample_counter += (uint32_t)(BATCH_SIZE * 2);
 
                 TickType_t now = xTaskGetTickCount();
