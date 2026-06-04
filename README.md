@@ -1,10 +1,13 @@
-# adc_2channels_DMA — branch: v2.1-interleaved
+# adc_2channels_DMA — branch: v2.1-interleaved_RMS
 
 Dual-channel ADC acquisition firmware for the **Dialog Semiconductor DA14706** (DA1470x family).  
 Measures current (CH0, P0.5) and voltage (CH1, P0.6) back-to-back in a tight interleaved loop,
-streams calibrated mV pairs over UART, and provides precise timing diagnostics via the ARM DWT
-cycle counter. This branch is the stable foundation for power calculations (Vrms, Irms, P, PF)
-on the next branch.
+computes **AC RMS for both channels** using a numerically stable two-pass algorithm, and outputs
+calibrated Vrms / Irms values as scaled integers over UART. Precise timing diagnostics are
+provided via the ARM DWT cycle counter.
+
+This branch adds RMS computation on top of the stable interleaved acquisition foundation from
+`v2.1-interleaved` and is the direct predecessor to power calculations (P, S, Q, PF).
 
 ---
 
@@ -20,6 +23,16 @@ on the next branch.
 - [ADC Configuration](#adc-configuration)
 - [GPIO Pin Mapping](#gpio-pin-mapping)
 - [Clock & Power Configuration](#clock--power-configuration)
+- [RMS Calculation](#rms-calculation)
+  - [Why mean subtraction is required](#why-mean-subtraction-is-required)
+  - [Two-pass algorithm](#two-pass-algorithm)
+  - [Windowed accumulation across batches](#windowed-accumulation-across-batches)
+  - [Why ZCD is not required at this stage](#why-zcd-is-not-required-at-this-stage)
+  - [Output as scaled integers](#output-as-scaled-integers)
+- [Calibration](#calibration)
+  - [Signal conditioning constants](#signal-conditioning-constants)
+  - [Calibration procedure](#calibration-procedure)
+  - [Measurement results](#measurement-results)
 - [Serial Output Protocol](#serial-output-protocol)
 - [Inter-Channel Skew](#inter-channel-skew)
   - [What it is](#what-it-is)
@@ -27,26 +40,23 @@ on the next branch.
   - [Impact on power calculations](#impact-on-power-calculations)
   - [How to compensate](#how-to-compensate)
 - [Throughput Analysis](#throughput-analysis)
-  - [Measured results](#measured-results)
+  - [Measured results](#measured-results-1)
   - [Why sample_time and oversampling have no effect](#why-sample_time-and-oversampling-have-no-effect)
   - [Is 2200 samples/channel/s enough?](#is-2200-sampleschannels-enough)
   - [How fs_acq is measured](#how-fs_acq-is-measured)
   - [Why fs_acq varies slightly between windows](#why-fs_acq-varies-slightly-between-windows)
-- [Calibration](#calibration)
 - [Multi-Task Architecture Notes](#multi-task-architecture-notes)
 - [Build Configurations](#build-configurations)
 - [Key Parameters](#key-parameters)
-- [Next Steps — ZC Detection, RMS, Power](#next-steps--zc-detection-rms-power)
+- [Next Steps — ZCD, Active Power, Power Factor](#next-steps--zcd-active-power-power-factor)
 
 ---
 
 ## Overview
 
-This project is the second major iteration of a power-measurement firmware for 50 Hz mains signals.
-It samples current (CH0) and voltage (CH1) in a strict per-sample interleaved pattern —
-CH0 then CH1 then CH0 then CH1 — so that each pair carries a known, fixed, measurable time offset
-(the **skew**). This skew is the phase-correction constant needed for accurate active power P
-and power factor PF calculations.
+This project is the third major iteration of a power-measurement firmware for 50 Hz mains signals.
+It builds directly on `v2.1-interleaved` (stable interleaved acquisition with DWT timing) and adds
+a complete AC RMS pipeline for both channels.
 
 **Key capabilities:**
 
@@ -54,9 +64,11 @@ and power factor PF calculations.
 - ARM DWT cycle counter for sub-microsecond timestamps with zero OS overhead
 - One-time startup skew measurement (`*skew=`) — the phase-correction constant T_SKEW
 - DWT-based true acquisition throughput (`*fs_acq`, `*us_pair`) — immune to UART print time
-- Per-channel linear calibration (offset + gain)
+- **AC RMS computation** using a two-pass mean-subtraction algorithm (numerically stable)
+- **1-second windowed RMS** — variance accumulated per batch, sqrt taken once per second
+- **Scaled integer output** — no float `printf`, shared format between UART and future BLE payload
+- Per-channel linear calibration (offset + gain) plus signal-chain scaling constants K_V and K_I
 - Configurable batch size (default 64 pairs)
-- Decimated UART output (`PRINT_EVERY`) for debugging
 - Three execution targets: RAM, QSPI flash, OQSPI flash
 
 ---
@@ -81,7 +93,7 @@ and power factor PF calculations.
 ```
 adc_2channels_DMA/
 ├── main.c                    # System init, clock setup, GPIO config, RTOS launch
-├── gpadc_app.c               # ADC acquisition task — all application logic
+├── gpadc_app.c               # ADC acquisition + RMS task — all application logic
 ├── gpadc_app.h               # Task entry point declarations
 └── config/
     ├── platform_devices.h    # Exported ADC device handle declarations
@@ -91,7 +103,8 @@ adc_2channels_DMA/
 ```
 
 Hardware initialization is centralised in `main.c → prvSetupHardware()`. `gpadc_app_init()` is
-intentionally empty — `gpadc_app_task()` is the single entry point for all acquisition logic.
+intentionally empty — `gpadc_app_task()` is the single entry point for all acquisition and
+computation logic.
 
 ---
 
@@ -134,18 +147,32 @@ should be created here alongside it with appropriate priorities — see
      acq_cycles_accum += DWT->CYCCNT - t_acq_start
      batches_in_window++
 
-  ② Conversion and print
-     For i = 0 .. BATCH_SIZE-1:
-       raw0[i] → ad_gpadc_conv_to_mvolt → correct_mv → mv0
-       raw1[i] → ad_gpadc_conv_to_mvolt → correct_mv → mv1
-       If (i % PRINT_EVERY == 0): printf("%d,%d\n", mv0, mv1)
+  ② Per-batch RMS accumulation
+     rms_mv0 = compute_ac_rms_mv(raw0)   ← two-pass, returns AC RMS in mV
+     rms_mv1 = compute_ac_rms_mv(raw1)
+     rms2_accum_ch0 += rms_mv0²          ← accumulate variance across batches
+     rms2_accum_ch1 += rms_mv1²
 
-  ③ Diagnostics — once per second
+  ③ Per-sample print  [disabled — #if 0]
+     raw → mV conversion + CSV printf (kept for debugging, re-enable by changing #if 0 → #if 1)
+
+  ④ Diagnostics — once per second
      total_pairs = batches_in_window × BATCH_SIZE
      fs_acq  = (total_pairs × 2 × CPU_CLOCK_HZ) / acq_cycles_accum
      us_pair = acq_cycles_accum / (total_pairs × 32)
+
+     rms_mv1_w = sqrt( rms2_accum_ch1 / batches )   ← windowed Vrms in mV
+     rms_mv0_w = sqrt( rms2_accum_ch0 / batches )   ← windowed Irms in mV
+
+     v_rms = K_V × rms_mv1_w / 1000                 ← mains Volts
+     i_rms = K_I × rms_mv0_w / HALL_SENSITIVITY     ← Amperes
+
+     v_rms_cV = (int32_t)(v_rms × 100)              ← centivolts
+     i_rms_mA = (int32_t)(i_rms × 1000)             ← milliamps
+
      Print: *fs_acq=<N>  *us_pair=<N>
-     Reset accumulators
+     Print: *Vrms=<cV/100>.<cV%100> V  *Irms=<mA/1000>.<mA%1000> A
+     Reset all accumulators
 ```
 
 `ad_gpadc_read_nof_conv(handle, 1, &dest)` is **synchronous and blocking** — it starts one
@@ -215,6 +242,183 @@ DWT-based measurements if the system clock drifted. Use XTAL32M for any measurem
 
 ---
 
+## RMS Calculation
+
+### Why mean subtraction is required
+
+Both analog signals are **bipolar AC** (mains voltage and Hall sensor current), but the signal
+conditioning circuit adds a DC offset to each so the full swing fits within the ADC's positive
+input range. The ADC therefore always reads a positive value:
+
+```
+adc_mv[i]  =  true_AC_signal[i]  +  DC_offset
+```
+
+The DC offset is an artifact of the signal conditioning circuit — it is **not** part of the
+original signal. If the raw ADC values were squared directly:
+
+```
+RMS_wrong = sqrt( (1/N) × Σ adc_mv[i]² )
+```
+
+the DC offset term (typically ~1650 mV for a 3.3 V supply) dominates the sum and the AC
+content is nearly lost to rounding. The correct approach removes the DC offset first.
+
+### Two-pass algorithm
+
+Implemented in `compute_ac_rms_mv()` in [gpadc_app.c](gpadc_app.c):
+
+**Pass 1 — compute the batch mean** (estimates the DC offset):
+
+```
+mean = (1/N) × Σ adc_mv[i]
+```
+
+**Pass 2 — compute RMS of the zero-centered residuals:**
+
+```
+rms_mv = sqrt( (1/N) × Σ (adc_mv[i] − mean)² )
+```
+
+This is mathematically equivalent to the standard deviation (square root of variance). Squaring
+small residuals `(adc_mv − mean)` instead of large absolute values keeps float32 precision well
+within acceptable bounds even when `DC >> AC amplitude`.
+
+The function is **intentionally isolated** — it takes only a raw buffer and its length. When
+Zero-Crossing Detection is added in the next branch, only the call site changes (what buffer and
+length are passed in), not this function.
+
+### Windowed accumulation across batches
+
+A single 64-sample batch covers ~1.44 mains cycles at the current sample rate — not an integer
+number. Rather than computing RMS once per batch, variance is accumulated across all batches
+within a 1-second window and the square root is taken once:
+
+```
+// per batch:
+rms2_accum += compute_ac_rms_mv(...)²    ← accumulate variance
+
+// once per second:
+rms_window = sqrt( rms2_accum / batches_in_window )
+```
+
+This is mathematically correct because averaging variances from multiple batches of a stationary
+signal converges to the true variance, and the sqrt is applied only once at the boundary.
+
+### Why ZCD is not required at this stage
+
+Zero-Crossing Detection (ZCD) aligns the accumulation window to complete mains cycles, eliminating
+the partial-cycle truncation bias at the window boundary. At the current sample rate:
+
+```
+fs per channel ≈ 2220 samples/s
+samples per mains cycle (50 Hz) ≈ 44.4
+cycles in 1-second window ≈ 44.4   →   partial cycle = 0.4 / 44.4 ≈ 0.9%
+```
+
+The worst-case RMS error from the partial-cycle truncation is well below 1% over a 1-second
+window — acceptable for Vrms and Irms at this stage.
+
+**ZCD becomes mandatory** for active power P and power factor PF, because those require the
+voltage and current samples to be aligned to the same complete cycles. ZCD is deferred to the
+next branch.
+
+### Output as scaled integers
+
+The DA1470x SDK uses **newlib-nano**, which strips float `printf` support by default to save
+flash. Rather than enabling it with `-u _printf_float` (~6–8 KB extra), results are converted
+to scaled integers before printing. The same integers are used directly in the future BLE
+payload — one conversion, two uses, no float format specifiers needed.
+
+| Constant       | Value | Unit          | Example              |
+|----------------|-------|---------------|----------------------|
+| `V_RMS_SCALE`  | 100   | centivolts    | 230.45 V → `23045`   |
+| `I_RMS_SCALE`  | 1000  | milliamps     |   1.500 A → `1500`   |
+
+`int32_t` is used for both. `int16_t` would cover up to 327.67 V and 32.767 A respectively —
+switch to `int16_t` for the BLE payload if range permits.
+
+---
+
+## Calibration
+
+### Signal conditioning constants
+
+Four constants in [gpadc_app.c](gpadc_app.c) describe the full signal chain from MCU ADC pin
+back to the original physical quantity:
+
+```c
+#define K_V                       (289.269f)  // mains V per ADC V  [V/V]
+#define K_I                       (1.298f)    // Hall mV per ADC mV [mV/mV]
+#define HALL_SENSITIVITY_MV_PER_A (80.0f)     // Hall sensor datasheet [mV/A]
+```
+
+The conversion in code:
+
+```c
+float v_rms = K_V * rms_mv1_w / 1000.0f;                     // Volts
+float i_rms = (K_I * rms_mv0_w) / HALL_SENSITIVITY_MV_PER_A; // Amps
+```
+
+There are also per-channel ADC-level calibration constants (applied before RMS computation):
+
+```c
+#define OFFSET_MV_CH0   0.0f   // subtract from raw mV reading
+#define GAIN_CH0        1.0f   // divide by this factor
+#define OFFSET_MV_CH1   0.0f
+#define GAIN_CH1        1.0f
+```
+
+### Calibration procedure
+
+To derive K_V and K_I from a reference instrument:
+
+1. Temporarily enable the raw calibration print in the diagnostics section:
+
+```c
+printf("*rms_mv_CH1=%"PRId32"  *rms_mv_CH0=%"PRId32"\n",
+       (int32_t)(rms_mv1_w * 10), (int32_t)(rms_mv0_w * 10));
+```
+
+The printed integers are in units of **0.1 mV** (tenths of millivolt). Divide by 10 to get mV.
+
+2. Record `rms_mv1_w` (CH1 voltage channel, mV) and `rms_mv0_w` (CH0 current channel, mV)
+   alongside the reference instrument's Vrms and Irms readings (stable resistive load, no
+   TRIAC switching):
+
+```
+K_V = PA_Vrms [V] × 1000 / rms_mv1_w [mV]
+K_I = PA_Irms [A] × HALL_SENSITIVITY_MV_PER_A / rms_mv0_w [mV]
+```
+
+3. Update the `#define` values and recompile.
+
+### Measurement results
+
+Calibration was performed against a power analyser on a resistive heat fan load at three
+operating modes. Before recalibration a **systematic ~3.4% low bias** was observed on both
+channels across all modes, indicating a uniform scaling error in the previous K_V and K_I
+values. After updating to `K_V = 289.269` and `K_I = 1.298`:
+
+| Mode | PA Vrms (V) | MCU Vrms (V)    | Error | PA Irms (A) | MCU Irms (A)  | Error |
+|------|-------------|-----------------|-------|-------------|---------------|-------|
+| 1    | 231.8       | 223.7 – 224.1   | ~3.3% | 4.4         | 4.17 – 4.19   | ~5%   |
+| 2    | 227.8       | 219.9 – 220.3   | ~3.4% | 8.4         | 8.10 – 8.14   | ~3.4% |
+| OFF  | 235.9       | 227.8 – 228.1   | ~3.4% | 0           | 0.23 – 0.24   | —     |
+
+**Notes:**
+- Residual ~3.4% error after first calibration was a uniform scaling factor — consistent with
+  a single measurement session at slightly different mains voltage than calibration conditions.
+  ZCD absence (< 1% truncation error) and skew (< 0.3% on Vrms/Irms) are not responsible.
+- The small Irms offset at OFF (~0.23 A) is the Hall sensor zero-current noise floor — the
+  sensor has a residual output at zero load that the signal conditioning does not fully suppress.
+  This is below the noise floor of the measurement and is acceptable for this application.
+- The heat fan uses a TRIAC phase-cutting controller. Vrms and Irms are correctly computed for
+  non-sinusoidal (phase-cut) waveforms by the definition-based RMS formula — no special handling
+  is needed.
+
+---
+
 ## Serial Output Protocol
 
 All output is ASCII text over the retarget UART (enabled by `CONFIG_RETARGET` in
@@ -222,26 +426,25 @@ All output is ASCII text over the retarget UART (enabled by `CONFIG_RETARGET` in
 
 | Line | When | Meaning |
 |------|------|---------|
-| `*skew=N cycles (~M us)` | Once at startup | CH0→CH1 inter-sample delay. Record this value — it is T_SKEW for PF compensation |
-| `<mv0>,<mv1>` | Every `PRINT_EVERY` pairs | Current (mV), Voltage (mV) — CSV for debugging |
-| `*fs_acq=N  *us_pair=N` | Once per second | True ADC throughput and average pair time, both measured from DWT |
-| `*loop_skew  first=N  mid=N  last=N us` | Once per second | Skew measured at i=0, i=BATCH_SIZE/2, i=BATCH_SIZE-1 of the last batch — confirms skew stability across the batch |
+| `*skew=N cycles (~M us)` | Once at startup | CH0→CH1 inter-sample delay. Record this value — it is T_SKEW for power factor compensation |
+| `*fs_acq=N  *us_pair=N` | Once per second | True ADC throughput and average pair time, measured from DWT |
+| `*Vrms=N.NN V  *Irms=N.NNN A` | Once per second | Windowed AC RMS, scaled integers printed as fixed-point |
+| `*rms_mv_CH1=N  *rms_mv_CH0=N` | Once per second (calibration mode) | Raw ADC channel RMS in 0.1 mV units — enable during calibration only |
 
-Example:
+Example output (normal operation):
 
 ```
-*skew=6688 cycles (~209 us)
-1234,987
-1236,985
-...
-*fs_acq=4418  *us_pair=452
-*loop_skew  first=209  mid=209  last=209 us
+*skew=6711 cycles (~209 us)
+*fs_acq=4421  *us_pair=452
+*Vrms=230.45 V  *Irms=4.380 A
+*fs_acq=4420  *us_pair=452
+*Vrms=230.47 V  *Irms=4.381 A
 ```
 
 **Important:** `printf` over UART is synchronous and blocking on this platform. Each character
-takes ~87 µs at 115200 baud. `PRINT_EVERY` and `BATCH_SIZE` directly affect how much time the
-task spends inside `printf`, but they do **not** affect `*fs_acq` or `*us_pair` — those are
-measured only over the acquisition loop, excluding all print time.
+takes ~87 µs at 115200 baud. `BATCH_SIZE` directly affects how much time the task spends inside
+`printf`, but does **not** affect `*fs_acq` or `*us_pair` — those are measured only over the
+acquisition loop, excluding all print time.
 
 ---
 
@@ -386,10 +589,9 @@ fs_acq  = (total_pairs × 2 × CPU_CLOCK_HZ) / acq_cycles_accum
 us_pair = acq_cycles_accum / (total_pairs × 32)
 ```
 
-This makes `fs_acq` immune to `PRINT_EVERY`, `BATCH_SIZE`, and UART congestion. The old approach
-of counting `sample_counter += BATCH_SIZE * 2` once per second produced values that dropped
-significantly when `PRINT_EVERY` was reduced (from 4430 Hz to 1408–1536 Hz) because print time
-was included in the measurement window.
+This makes `fs_acq` immune to `BATCH_SIZE` and UART congestion. The old approach of counting
+`sample_counter += BATCH_SIZE * 2` once per second produced values that dropped significantly
+when print density increased because print time was included in the measurement window.
 
 ### Why fs_acq varies slightly between windows
 
@@ -403,30 +605,6 @@ artifact, not real jitter in the ADC timing. Two causes:
 
 `us_pair` (450–452 µs) is the stable metric — it averages over all pairs in the window and
 is not affected by window-boundary timing. Use `us_pair` for timing calculations, not `fs_acq`.
-
----
-
-## Calibration
-
-Each channel has two constants at the top of [gpadc_app.c](gpadc_app.c):
-
-```c
-#define OFFSET_MV_CH0   0.0f   // subtract from raw mV reading
-#define GAIN_CH0        1.0f   // divide by this factor
-
-#define OFFSET_MV_CH1   0.0f
-#define GAIN_CH1        1.0f
-```
-
-Applied by `correct_mv()`:
-
-```
-corrected_mv = (raw_mv − offset) / gain
-```
-
-Values below zero after correction are clamped to 0. The defaults pass raw values through
-unchanged. To calibrate: apply a known reference voltage, compare to the reported value,
-then set `OFFSET_MV` to the measured DC error and `GAIN` to the ratio of expected/reported.
 
 ---
 
@@ -488,55 +666,57 @@ All three configurations enable the same ADC-relevant flags in `custom_config_*.
 
 All commonly-tuned values in [gpadc_app.c](gpadc_app.c):
 
-| Symbol             | Default     | Purpose |
-|--------------------|-------------|---------|
-| `BATCH_SIZE`       | `64`        | Pairs per loop iteration. Range 32–256. Larger → smoother `*fs_acq` average, higher latency. Smaller → lower latency, noisier `*fs_acq`. Each unit costs 4 bytes of BSS (2 × uint16_t) |
-| `PRINT_EVERY`      | `2`         | Print 1 in every N pairs. Does not affect `*fs_acq`. Set to 1 for full data, higher to reduce UART load |
-| `CPU_CLOCK_HZ`     | `32000000`  | Must match `cm_sys_clk_init(sysclk_XTAL32M)`. Used in all DWT µs conversions |
-| `OFFSET_MV_CH0/1`  | `0.0f`      | DC offset calibration per channel (mV) |
-| `GAIN_CH0/1`       | `1.0f`      | Gain calibration per channel |
+| Symbol                      | Default      | Purpose |
+|-----------------------------|--------------|---------|
+| `BATCH_SIZE`                | `64`         | Pairs per loop iteration. Larger → smoother RMS average, higher latency. Each unit costs 4 bytes of BSS (2 × uint16_t) |
+| `CPU_CLOCK_HZ`              | `32000000`   | Must match `cm_sys_clk_init(sysclk_XTAL32M)`. Used in all DWT µs conversions |
+| `OFFSET_MV_CH0/1`           | `0.0f`       | DC offset calibration per channel (mV), applied before RMS |
+| `GAIN_CH0/1`                | `1.0f`       | Gain calibration per channel, applied before RMS |
+| `K_V`                       | `289.269`    | Mains Volts per ADC Volt — signal chain scaling for voltage channel |
+| `K_I`                       | `1.298`      | Hall sensor mV per ADC mV — signal chain scaling for current channel |
+| `HALL_SENSITIVITY_MV_PER_A` | `80.0`       | Hall sensor sensitivity from datasheet [mV/A] |
+| `V_RMS_SCALE`               | `100`        | Output scaling: result in centivolts (230.45 V → `23045`) |
+| `I_RMS_SCALE`               | `1000`       | Output scaling: result in milliamps (1.500 A → `1500`) |
 
 ---
 
-## Next Steps — ZC Detection, RMS, Power
+## Next Steps — ZCD, Active Power, Power Factor
 
-This branch delivers stable, calibrated, time-tagged V/I sample pairs. The next branch builds
-power calculations on top of this foundation.
+This branch delivers stable, calibrated, windowed Vrms and Irms. The next branch builds
+active power and power factor on top.
 
-### Design notes for the next branch
+### Zero-Crossing Detection
 
-**Accumulate over complete mains cycles, not fixed time windows.**
-Partial cycles at the start and end of a fixed time window introduce a bias error in Vrms,
-Irms, and P. Use zero-crossing detection on the voltage channel (CH1) to mark cycle boundaries
-and accumulate only over whole cycles.
-
-```c
-// Zero-crossing: rising edge on voltage (CH1 crosses zero from below)
-bool zc = (prev_mv1 < 0) && (mv1_val >= 0);
-```
-
-Accumulate `sum_v2 += mv1*mv1`, `sum_i2 += mv0*mv0`, `sum_p += mv0*mv1` between crossings.
-On each crossing: finalise the previous cycle, reset accumulators.
-
-**Vrms and Irms are not affected by skew.** Only compute the skew compensation for P:
+ZCD replaces the fixed 1-second accumulation window with cycle-aligned windows. For Vrms and
+Irms this improves the < 1% truncation bias to zero. For P and PF it is **mandatory** — partial
+cycles introduce a systematic bias that cannot be averaged away.
 
 ```c
-// Interpolate voltage to the time current was sampled:
-float v_at_i = mv1[i] + (mv1[i+1] - mv1[i]) * (T_SKEW_US / T_SAMPLE_US);
-sum_p += mv0[i] * v_at_i;
+// Rising zero-crossing on voltage channel (after mean subtraction):
+bool zc = (prev_mv1_centered < 0.0f) && (mv1_centered >= 0.0f);
 ```
 
-**Quantities to compute per mains cycle:**
+The `compute_ac_rms_mv()` function in this branch is already designed for this: when ZCD is
+added, only the call site changes (passing a cycle-aligned buffer instead of a fixed-length
+batch). The function itself is unchanged.
+
+### Active Power, Apparent Power, Reactive Power, Power Factor
+
+With cycle-aligned V and I samples and skew compensation:
 
 ```
-Vrms = sqrt(mean(V²))
-Irms = sqrt(mean(I²))
+Vrms = sqrt( mean(V²) )
+Irms = sqrt( mean(I²) )
 P    = mean(V_compensated × I)          [active power, watts]
 S    = Vrms × Irms                      [apparent power, VA]
 Q    = sqrt(S² − P²)                    [reactive power, VAr]
 PF   = P / S                            [power factor, −1 to +1]
 ```
 
-**BLE transmission:** compute per-cycle values on-chip, buffer N cycles, send a compact struct
-via BLE notification. Do not stream raw samples over BLE — the data rate does not fit within a
-standard connection interval, and raw samples are not the end goal.
+### BLE Transmission
+
+The scaled integers (`v_rms_cV`, `i_rms_mA`) introduced in this branch are already in the
+correct format for BLE payload packing. The next branch will add `p_cW` (centiwatts) and
+`pf_scaled` (PF × 1000) using the same pattern, and send a compact struct via a BLE
+notification characteristic — no float encoding, no `-u _printf_float`, consistent with the
+approach established here.
