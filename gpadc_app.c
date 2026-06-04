@@ -117,12 +117,18 @@ void gpadc_app_task(void *pvParameters)
         for (;;) {
 
                 /* ── 1. Interleaved acquisition ──────────────────────────── */
-                uint32_t t_acq_start = DWT->CYCCNT;
+                uint32_t t_acq_start   = DWT->CYCCNT;
+                // uint32_t t_ch0_done    = 0;
+                // uint32_t t_ch1_done    = 0;
+                // uint32_t skew_first_cy = 0;   /* skew at i=0            */
+                // uint32_t skew_mid_cy   = 0;   /* skew at i=BATCH_SIZE/2 */
+                // uint32_t skew_last_cy  = 0;   /* skew at i=BATCH_SIZE-1 */
 
                 for (int i = 0; i < BATCH_SIZE; i++) {
                         ad_gpadc_handle_t h0 = ad_gpadc_open(CHAN0_DEVICE);
                         if (h0) {
                                 ad_gpadc_read_nof_conv(h0, 1, &raw0[i]);
+                                // t_ch0_done = DWT->CYCCNT;   /* CH0 sample just arrived */
                                 ad_gpadc_close(h0, false);
                         } else {
                                 raw0[i] = 0;
@@ -130,10 +136,15 @@ void gpadc_app_task(void *pvParameters)
                         ad_gpadc_handle_t h1 = ad_gpadc_open(CHAN1_DEVICE);
                         if (h1) {
                                 ad_gpadc_read_nof_conv(h1, 1, &raw1[i]);
+                                // t_ch1_done = DWT->CYCCNT;   /* CH1 sample just arrived */
                                 ad_gpadc_close(h1, false);
                         } else {
                                 raw1[i] = 0;
                         }
+
+                        // if      (i == 0)              skew_first_cy = t_ch1_done - t_ch0_done;
+                        // else if (i == BATCH_SIZE / 2) skew_mid_cy   = t_ch1_done - t_ch0_done;
+                        // else if (i == BATCH_SIZE - 1) skew_last_cy  = t_ch1_done - t_ch0_done;
                 }
 
                 acq_cycles_accum  += DWT->CYCCNT - t_acq_start;   // Measures the acquisition time for [ch0-ch1] x 64samples -> total od 128samples
@@ -186,6 +197,13 @@ void gpadc_app_task(void *pvParameters)
                                         / (total_pairs * (CPU_CLOCK_HZ / 1000000UL));
                                 printf("*fs_acq=%u  *us_pair=%u\n",
                                        (unsigned)fs_acq, (unsigned)us_pair);
+                                /* Loop skew — same method as startup *skew=, but taken at
+                                 * three points inside the batch to confirm it is stable.
+                                 * Values are from the last completed batch in this window. */
+                                // printf("*loop_skew  first=%u  mid=%u  last=%u us\n",
+                                //        (unsigned)(skew_first_cy / (CPU_CLOCK_HZ / 1000000UL)),
+                                //        (unsigned)(skew_mid_cy   / (CPU_CLOCK_HZ / 1000000UL)),
+                                //        (unsigned)(skew_last_cy  / (CPU_CLOCK_HZ / 1000000UL)));
                         }
                         acq_cycles_accum  = 0;
                         batches_in_window = 0;
